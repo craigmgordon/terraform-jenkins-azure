@@ -1,0 +1,61 @@
+trigger: none
+
+pr:
+  branches:
+    include:
+      - "*"
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  TF_VERSION: "1.6.6"   # pin for consistency; change if you standardise elsewhere
+
+steps:
+  - checkout: self
+    fetchDepth: 0
+
+  - task: Bash@3
+    displayName: Install Terraform $(TF_VERSION)
+    inputs:
+      targetType: inline
+      script: |
+        set -euo pipefail
+        if terraform version >/dev/null 2>&1; then
+          echo "Terraform already installed:"
+          terraform version
+        else
+          echo "Installing Terraform ${TF_VERSION}..."
+          curl -sSLo /tmp/terraform.zip "https://releases.hashicorp.com/terraform/${TF_VERSION}/terraform_${TF_VERSION}_linux_amd64.zip"
+          sudo unzip -o /tmp/terraform.zip -d /usr/local/bin
+          rm -f /tmp/terraform.zip
+          terraform version
+        fi
+
+  - task: Bash@3
+    displayName: Terraform format check (repo)
+    inputs:
+      targetType: inline
+      script: |
+        set -euo pipefail
+        terraform fmt -check -recursive
+
+  - task: Bash@3
+    displayName: Terraform validate (environments/dev)
+    inputs:
+      targetType: inline
+      script: |
+        set -euo pipefail
+        cd environments/dev
+        terraform init -backend=false -input=false
+        terraform validate -no-color
+
+  - task: Bash@3
+    displayName: Terraform validate (environments/prod)
+    inputs:
+      targetType: inline
+      script: |
+        set -euo pipefail
+        cd environments/prod
+        terraform init -backend=false -input=false
+        terraform validate -no-color
