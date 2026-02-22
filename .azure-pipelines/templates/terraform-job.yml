@@ -1,0 +1,135 @@
+# .azure-pipelines/templates/terraform-job.yml
+parameters:
+  # Display name
+  name: "Terraform"
+
+  # Azure DevOps service connection name (required for plan/apply/destroy when using real backend)
+  azureSubscription: ""
+
+  # Terraform working directory (folder containing main.tf etc.)
+  workingDirectory: "environments/dev"
+
+  # Action: validate | plan | apply | destroy
+  action: "plan"
+
+  # Var file name within workingDirectory (optional)
+  varFile: ""
+
+  # Plan file name (within workingDirectory)
+  planFile: "tfplan"
+
+  # Whether to init with backend (true for plan/apply/destroy, false for PR validate)
+  backend: true
+
+  # Terraform version to install (if you want to call install template outside, set empty)
+  terraformVersion: "1.6.6"
+
+  # Publish artifacts for plan/apply
+  publishPlanArtifact: true
+  planArtifactName: "tfplan"
+
+  # Extra args
+  extraInitArgs: ""
+  extraPlanArgs: ""
+  extraApplyArgs: ""
+  extraDestroyArgs: ""
+
+  # If apply: path to plan file downloaded as artifact (optional)
+  # Example: $(Pipeline.Workspace)/tfplan-dev/tfplan
+  applyPlanPath: ""
+
+jobs:
+  - job: tf_${{ lower(parameters.action) }}
+    displayName: "${{ parameters.name }} (${{ parameters.action }})"
+    pool:
+      vmImage: ubuntu-latest
+
+    steps:
+      - checkout: self
+        fetchDepth: 0
+
+      # Install Terraform (optional; you can also do this outside the template)
+      - ${{ if ne(parameters.terraformVersion, '') }}:
+        - template: install-terraform.yml
+          parameters:
+            terraformVersion: ${{ parameters.terraformVersion }}
+
+      # Validate is backend-less by default; plan/apply/destroy usually need Azure auth + backend
+      - ${{ if eq(parameters.action, 'validate') }}:
+        - bash: |
+            set -euo pipefail
+            cd "${{ parameters.workingDirectory }}"
+            terraform init -backend=false -input=false ${{ parameters.extraInitArgs }}
+            terraform validate -no-color
+          displayName: "terraform init (no backend) + validate"
+
+      # For plan/apply/destroy use AzureCLI task (service connection) so we can export ARM_* vars
+      - ${{ if ne(parameters.action, 'validate') }}:
+        - task: AzureCLI@2
+          displayName: "Terraform ${{ parameters.action }} (Azure auth + init)"
+          inputs:
+            azureSubscription: "${{ parameters.azureSubscription }}"
+            scriptType: bash
+            scriptLocation: inlineScript
+            addSpnToEnvironment: true
+            inlineScript: |
+              set -euo pipefail
+              export TF_IN_AUTOMATION=true
+
+              # Export ARM_* for Terraform azurerm provider
+              export ARM_CLIENT_ID="${servicePrincipalId}"
+              export ARM_CLIENT_SECRET="${servicePrincipalKey}"
+              export ARM_TENANT_ID="${tenantId}"
+              export ARM_SUBSCRIPTION_ID="$(az account show --query id -o tsv)"
+
+              cd "${{ parameters.workingDirectory }}"
+
+              if [[ "${{ parameters.backend }}" == "true" ]]; then
+                terraform init -input=false ${{ parameters.extraInitArgs }}
+              else
+                terraform init -backend=false -input=false ${{ parameters.extraInitArgs }}
+              fi
+
+              case "${{ parameters.action }}" in
+                plan)
+                  VAR_ARG=""
+                  if [[ -n "${{ parameters.varFile }}" ]]; then
+                    VAR_ARG="-var-file=${{ parameters.varFile }}"
+                  fi
+
+                  terraform plan -input=false ${VAR_ARG} ${{ parameters.extraPlanArgs }} -out="${{ parameters.planFile }}"
+                  terraform show -no-color "${{ parameters.planFile }}" > tfplan.txt
+                  ;;
+
+                apply)
+                  if [[ -n "${{ parameters.applyPlanPath }}" ]]; then
+                    terraform apply -input=false -auto-approve ${{ parameters.extraApplyArgs }} "${{ parameters.applyPlanPath }}"
+                  else
+                    VAR_ARG=""
+                    if [[ -n "${{ parameters.varFile }}" ]]; then
+                      VAR_ARG="-var-file=${{ parameters.varFile }}"
+                    fi
+                    terraform apply -input=false -auto-approve ${VAR_ARG} ${{ parameters.extraApplyArgs }}
+                  fi
+                  ;;
+
+                destroy)
+                  VAR_ARG=""
+                  if [[ -n "${{ parameters.varFile }}" ]]; then
+                    VAR_ARG="-var-file=${{ parameters.varFile }}"
+                  fi
+                  terraform destroy -input=false -auto-approve ${VAR_ARG} ${{ parameters.extraDestroyArgs }}
+                  ;;
+
+                *)
+                  echo "Unsupported action: ${{ parameters.action }}"
+                  exit 1
+                  ;;
+              esac
+
+      # Publish plan artifacts (only relevant for plan)
+      - ${{ if and(eq(parameters.action, 'plan'), eq(parameters.publishPlanArtifact, true)) }}:
+        - publish: ${{ parameters.workingDirectory }}/${{ parameters.planFile }}
+          artifact: ${{ parameters.planArtifactName }}
+        - publish: ${{ parameters.workingDirectory }}/tfplan.txt
+          artifact: ${{ parameters.planArtifactName }}-text
